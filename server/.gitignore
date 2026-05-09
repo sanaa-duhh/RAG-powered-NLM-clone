@@ -1,0 +1,11 @@
+node_modules/
+.env
+.env.local
+.env.production
+
+# Keep the uploads folder tracked but ignore its contents
+uploads/*
+!uploads/.gitkeep
+
+*.log
+npm-debug.log*

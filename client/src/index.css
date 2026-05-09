@@ -1,0 +1,60 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body {
+    @apply bg-void text-slate-200;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* Thin custom scrollbar — subtle, accent on hover */
+  ::-webkit-scrollbar        { width: 5px; height: 5px; }
+  ::-webkit-scrollbar-track  { background: transparent; }
+  ::-webkit-scrollbar-thumb  { @apply bg-white/10 rounded-full; }
+  ::-webkit-scrollbar-thumb:hover { @apply bg-emerald-400/20; }
+  *                          { scrollbar-width: thin; scrollbar-color: rgba(255,255,255,0.08) transparent; }
+}
+
+/*
+ * .markdown — prose styles for assistant message content.
+ * Applied to the wrapper div around <ReactMarkdown>.
+ * Only block-level layout + color — code is styled via components prop.
+ */
+@layer components {
+  .markdown p            { @apply text-slate-300 leading-relaxed mb-3; }
+  .markdown p:last-child { @apply mb-0; }
+
+  .markdown h1 { @apply text-slate-100 text-xl font-semibold mt-5 mb-2.5; }
+  .markdown h2 { @apply text-slate-100 text-lg font-semibold mt-4 mb-2; }
+  .markdown h3 { @apply text-slate-200 text-base font-semibold mt-3 mb-1.5; }
+
+  /* First heading in a message: no top margin */
+  .markdown h1:first-child,
+  .markdown h2:first-child,
+  .markdown h3:first-child { @apply mt-0; }
+
+  .markdown strong { @apply text-slate-100 font-semibold; }
+  .markdown em     { @apply italic text-slate-400; }
+
+  .markdown ul { @apply list-disc ml-5 mb-3 space-y-1; }
+  .markdown ol { @apply list-decimal ml-5 mb-3 space-y-1; }
+  .markdown li { @apply text-slate-300 leading-relaxed; }
+  /* Nested lists */
+  .markdown li > ul,
+  .markdown li > ol { @apply mt-1 mb-0; }
+
+  .markdown hr { @apply border-white/10 my-4; }
+
+  .markdown blockquote   { @apply border-l-2 border-emerald-400/30 pl-4 my-3; }
+  .markdown blockquote p { @apply italic text-slate-400 mb-0; }
+
+  .markdown a { @apply text-emerald-400 underline decoration-emerald-400/30 hover:text-emerald-300; }
+
+  /* Spacing between sibling block elements in a message */
+  .markdown > * + h1,
+  .markdown > * + h2,
+  .markdown > * + h3 { @apply mt-4; }
+}

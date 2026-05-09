@@ -1,0 +1,92 @@
+'use strict';
+
+/**
+ * Central configuration for the RAG pipeline.
+ *
+ * All constants live here. No other file hardcodes these values.
+ * Changing behavior (chunk size, top-k, model) requires edits only here.
+ *
+ * Values that vary by environment come from process.env.
+ * dotenv must be loaded before this module is required.
+ */
+
+module.exports = {
+  // --- File upload ---
+  upload: {
+    maxSizeBytes: 15 * 1024 * 1024, // 15MB
+    allowedMimeTypes: ['application/pdf', 'text/plain'],
+  },
+
+  // --- Document chunking ---
+  chunking: {
+    chunkSize: 1000, // characters per chunk (~200-250 words)
+    chunkOverlap: 200, // overlap preserves context at boundaries
+    minChunkLength: 50, // chunks shorter than this are warned as low-quality
+  },
+
+  // --- Embeddings ---
+  embeddings: {
+    provider: process.env.EMBEDDING_PROVIDER || 'huggingface',
+    timeoutMs: 60_000, // HuggingFace cold starts can take 20-40s
+
+    providers: {
+      huggingface: {
+        model: process.env.EMBEDDING_MODEL || 'BAAI/bge-small-en-v1.5',
+        vectorSize: 384,
+        baseUrl: 'https://router.huggingface.co/hf-inference/models',
+      },
+      openai: {
+        model: 'text-embedding-3-small',
+        vectorSize: 1536,
+        baseUrl: 'https://api.openai.com/v1/embeddings',
+      },
+    },
+  },
+
+  // --- Vector store (Qdrant) ---
+  qdrant: {
+    collection: process.env.COLLECTION_NAME || 'documents',
+    // Vector size must match the active embedding model's output dimension.
+    // Changing the model requires recreating the collection.
+    vectorSize: 384,
+  },
+
+  // --- Retrieval ---
+  retrieval: {
+    defaultTopK: 4,
+    defaultMinScore: 0.4,
+
+    // Candidate over-fetch multiplier — retrieve.js fetches topK * this
+    // before deduplication so the final topK slots have more to choose from.
+    candidateMultiplier: 3,
+
+    // Context budget — caps what gets forwarded to the LLM (Phase 3).
+    // At ~250 words/1000 chars, 4000 chars ≈ 1000 words of context.
+    maxContextChunks: 5,
+    maxContextChars: 4000,
+
+    // Jaccard similarity above this between two chunks → near-duplicate → drop lower score.
+    // 0.85 catches true duplicates; lower (0.5) would also remove heavy-overlap pairs.
+    dedupeThreshold: 0.85,
+
+    // Warn if top retrieval score is below this — suggests weakly relevant context.
+    lowConfidenceWarnScore: 0.5,
+  },
+
+  // --- LLM (OpenRouter) ---
+  llm: {
+    model: process.env.LLM_MODEL || 'openai/gpt-oss-20b:free',
+    temperature: 0.1, // low = deterministic, prevents creative hallucinations
+    timeoutMs: 30_000,
+    baseUrl: 'https://openrouter.ai/api/v1/chat/completions',
+
+    // Retry on 5xx / rate limits — free tier models can be briefly unavailable
+    maxRetries: 2,
+    retryDelayMs: 1_500,
+
+    // Guard rail: if system prompt + context + question exceed this, log a warning.
+    // retrieve.js budgets context at 4000 chars; system prompt ~600; question ~2000.
+    // 12 000 chars is well above normal usage — catches runaway prompts only.
+    maxPromptChars: 12_000,
+  },
+};
