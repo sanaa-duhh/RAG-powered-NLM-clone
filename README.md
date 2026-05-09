@@ -446,46 +446,7 @@ The retrieval pipeline computes a top-score and classifies confidence as `high` 
 
 ---
 
-## Design Decisions
 
-**Why Qdrant?**
-Qdrant Cloud has a free tier that handles persistent vector storage without self-hosting. More importantly, it supports payload indexing, which allows filtering searches to a specific `documentId` without scanning all points. This makes per-document isolation scalable — you can store thousands of documents in one collection and never cross-contaminate results.
-
-**Why `BAAI/bge-small-en-v1.5`?**
-It is free (HuggingFace Inference API), small (384 dimensions — less storage, faster search), and produces unit-normalised vectors that work correctly with cosine similarity. BGE models are specifically trained for retrieval tasks, not just classification, which matters for RAG quality. The free HuggingFace tier has cold-start latency — this is absorbed by setting `wait_for_model: true` in the API call and implementing exponential-backoff retries.
-
-**Why `noFallback: true` during retrieval?**
-The embedding module supports a HuggingFace → OpenAI fallback for resilience. During indexing, this fallback is allowed because the document has never been embedded before. During retrieval, it is explicitly disabled: if the query embedding used OpenAI's 1536-dim model while the stored document vectors used HuggingFace's 384-dim model, cosine scores would be meaningless. `noFallback: true` is a hard contract that prevents silent dimension mismatch corruption.
-
-**Why candidate over-fetch + Jaccard deduplication?**
-Retrieval with `topK=4` but fetching `4 × 3 = 12` candidates gives the deduplication step room to work. Documents with high overlap between consecutive chunks often produce near-duplicate results at page boundaries. Fetching 3× candidates and dropping duplicates (Jaccard ≥ 0.85) consistently produces 4 meaningfully distinct context chunks, rather than 4 copies of the same passage.
-
-**Why stateless chat (no conversation memory)?**
-This is a deliberate simplification. Adding a conversation history window would require deciding how to handle cases where earlier context references a different part of the document than the current question — a non-trivial retrieval problem. Stateless queries are also easier to evaluate: each answer is independently grounded, which makes the refusal behavior more predictable. Conversational memory is a natural Phase 2 addition.
-
-**Why local React state?**
-The application has one document at a time and one linear conversation thread. The state hierarchy is shallow: `App.jsx` owns `documentId` and `filename`; `ChatPanel.jsx` owns `messages`, `question`, and `isLoading`. There is no cross-component state that would justify a store. Adding Zustand or Context would be indirection without benefit at this scope.
-
----
-
-## Challenges & Learnings
-
-**HuggingFace API migration**
-Midway through development the `api-inference.huggingface.co/pipeline/feature-extraction/` endpoint was deprecated in favour of `router.huggingface.co/hf-inference/models`. The new router has a different URL structure but the same request/response shape. The fix was a one-line config change, but discovering it required curl-probing both endpoints and inspecting the response shape to confirm vector dimensions matched before trusting the output.
-
-**Qdrant Cloud strict mode**
-Local Qdrant accepts filter queries on any payload field. Qdrant Cloud enforces strict mode: payload fields used as filters must have an explicit keyword index, or the search returns HTTP 400. The fix is `createPayloadIndex({ field_name: 'documentId', field_schema: 'keyword' })`, which is idempotent and now runs on every server startup. The debugging process involved reproducing the raw HTTP request with curl to isolate whether the error was in the client library or the cloud service.
-
-**Retrieval tuning**
-`BAAI/bge-small-en-v1.5` produces higher baseline cosine similarities than many other embedding models — even unrelated English text pairs score around 0.41–0.52. Setting `defaultMinScore: 0.4` means the threshold excludes truly irrelevant results while remaining permissive enough for legitimate queries. The testStorage end-to-end test caught a subtle semantic ranking issue: a "thread safety and locking" query ranked "lazy initialization" (which mentions object creation) above "double-checked locking". The fix was widening the assertion to check the top-2 results rather than strictly the top-1 — the correct chunk was always present, just occasionally ranked second by a 0.02 margin.
-
-**Prompt grounding reliability**
-An early system prompt that said "only use the context" was insufficient — some models would preface answers with legitimate-sounding context and then continue with confabulated detail. The current prompt uses an exact sentinel phrase, seven numbered rules, and a low temperature of 0.1. `validateAnswer()` also scans the first sentence of the response for paraphrased refusals, normalising them to the canonical phrase before returning to the client.
-
-**OpenRouter model churn**
-The initially configured model (`deepseek/deepseek-chat-v3-0324:free`) was removed from OpenRouter during development. Rather than just swapping the model ID, the replacement was validated against two criteria: HTTP 200 on a probe request, and exact compliance with the sentinel phrase on a grounding test. `openai/gpt-oss-20b:free` passed both. The `LLM_MODEL` env var makes future substitutions a config-only change.
-
----
 
 ## Future Improvements
 
