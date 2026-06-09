@@ -2,8 +2,7 @@
 
 const AppError = require('../utils/AppError');
 const { logStep } = require('../utils/logger');
-const { retrieveChunks } = require('../rag/retrieve');
-const { generateAnswer } = require('../rag/generate');
+const { runPipeline } = require('../rag/ragPipeline');
 
 /**
  * POST /api/chat
@@ -23,7 +22,6 @@ const { generateAnswer } = require('../rag/generate');
  */
 async function chat(req, res, next) {
   try {
-    // history is accepted in the API contract but not used (no conversation memory)
     const { question, documentId } = req.body;
 
     if (!question || question.trim() === '') {
@@ -40,11 +38,7 @@ async function chat(req, res, next) {
 
     logStep('CHAT', `"${question.slice(0, 80)}..." | documentId: ${documentId}`);
 
-    // Stage 1: Retrieve relevant chunks from Qdrant
-    const retrievalResult = await retrieveChunks(question, documentId);
-
-    // Stage 2: Generate a grounded answer using the retrieved context
-    const generation = await generateAnswer(retrievalResult);
+    const { retrievalResult, generation } = await runPipeline(question, documentId);
 
     res.json({
       success: true,

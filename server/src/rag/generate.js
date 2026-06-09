@@ -365,4 +365,4 @@ function sleep(ms) {
 
 // ---------------------------------------------------------------------------
 
-module.exports = { generateAnswer };
+module.exports = { generateAnswer, REFUSAL_PHRASE };

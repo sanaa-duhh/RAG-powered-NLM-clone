@@ -44,6 +44,10 @@ The result is a document-scoped assistant that cites its sources and is transpar
 | Markdown rendering | Assistant answers render `**bold**`, headings, lists, inline code |
 | Dark theme UI | Premium charcoal/emerald design system — TailwindCSS, no CSS framework |
 | End-to-end test suite | 4 isolated test scripts — embeddings, storage, retrieval, full pipeline |
+| **Query rewriting** | LLM rewrites user questions into retrieval-optimized natural language before embedding |
+| **LLM-as-Judge reranking** | All retrieved chunks are scored 0-10 by an LLM and re-sorted by semantic relevance |
+| **Confidence gate** | Three-tier cosine threshold — judge only fires in the uncertain zone, saving ~10s on clear queries |
+| **CRAG corrective loop** | On uncertain retrieval, a second pass with the original question is attempted and compared |
 
 ---
 
@@ -107,10 +111,18 @@ flowchart LR
     end
 
     subgraph Chat ["💬 Chat Pipeline (once per question)"]
-        F[User question] --> G[Embed query\nnoFallback=true]
+        F[User question] --> F1[Query rewriting\nLLM optimizes for retrieval]
+        F1 --> G[Embed query\nnoFallback=true]
         G --> H[Qdrant cosine search\nfiltered by documentId]
-        H --> I[Deduplicate + budget]
-        I --> J[Grounded prompt\nOpenRouter LLM]
+        H --> I[Deduplicate + budget\n12 candidates → top 5]
+        I --> I1{Confidence gate\ntopScore threshold}
+        I1 -->|score ≥ 0.65| J
+        I1 -->|score < 0.35| R[Hard refuse]
+        I1 -->|uncertain zone| I2[LLM-as-Judge\nscores all chunks 0-10]
+        I2 -->|HIGH| J
+        I2 -->|LOW| R
+        I2 -->|MEDIUM| I3[CRAG corrective pass\nretry with original question]
+        I3 --> J[Grounded prompt\nOpenRouter LLM]
         J --> K[Answer + citations]
     end
 ```
@@ -448,16 +460,103 @@ The retrieval pipeline computes a top-score and classifies confidence as `high` 
 
 
 
+## Advanced RAG & Corrective RAG
+
+Beyond the baseline pipeline, four additional stages run on every chat request to improve retrieval quality and answer accuracy.
+
+### Phase A — Query Rewriting
+
+Before the user's question is embedded, a lightweight LLM call rewrites it into a more retrieval-friendly form. This closes the vocabulary gap between how users phrase questions and how documents are written.
+
+```
+"What does it say about this topic?"
+         ↓
+"What does this document say about this topic and what are the key points covered?"
+```
+
+The rewriter uses `temperature: 0.05` for near-deterministic output and a 5-second hard timeout. On any failure — timeout, API error, empty response — it falls back to the original question silently. The pipeline always continues.
+
+---
+
+### Phase B — LLM-as-Judge Retrieval Reranking
+
+Qdrant returns chunks ordered by cosine similarity — geometric proximity in embedding space. For broad or conceptual questions, this often surfaces code blocks and implementation details above explanatory text, because they share vocabulary but not intent.
+
+After retrieval, all candidate chunks are sent to an LLM judge in **a single batched API call**. The judge scores each chunk 0-10 with a verdict and one-line reason:
+
+```
+Chunk 0 | Score: 9 | Verdict: HIGH  | directly explains the Adapter pattern concept
+Chunk 1 | Score: 2 | Verdict: LOW   | raw Java code, no surrounding explanation
+Chunk 2 | Score: 6 | Verdict: MEDIUM| implementation detail with brief context
+```
+
+Chunks are re-sorted by judge score before generation. Code that Qdrant ranked first because it shared vocabulary gets demoted; conceptual explanations rise to the top. The single batched call avoids the rate-limit and cost problems of evaluating chunks in parallel.
+
+---
+
+### Phase C — Confidence Gate
+
+The judge adds cost and latency. Running it on every request — including those where retrieval is clearly good or clearly useless — would be wasteful. A three-tier gate decides whether the judge is needed at all:
+
+| Cosine `topScore` | Action | Rationale |
+|---|---|---|
+| `< 0.35` | Hard refuse — skip judge | Geometrically far from query; judge would just confirm irrelevance |
+| `0.35 – 0.65` | Run judge, act on verdict | Uncertain zone — cosine alone is unreliable here |
+| `≥ 0.65` | Skip judge, generate directly | High-confidence retrieval; judge would just confirm |
+
+This means well-formed specific questions skip the judge entirely and get fast, direct answers. The judge only fires when there is genuine uncertainty.
+
+---
+
+### Phase D — Corrective Retrieval Loop (CRAG)
+
+When the judge returns a **MEDIUM** verdict (context partially relevant, but insufficient), the pipeline attempts one corrective retrieval pass using the **original un-rewritten question**:
+
+- The Phase A rewrite may have shifted the embedding in a direction that missed relevant chunks
+- The original question embeds differently and may surface different candidates
+- If the corrective pass's top judge score exceeds the first pass, those chunks are used instead
+- If not, the original result is kept and generation proceeds
+
+When the judge returns **LOW** (irrelevant), the pipeline refuses immediately without calling the LLM — saving both generation cost and latency.
+
+```
+question
+  → rewriteQuery()          Phase A: retrieval-optimized query
+  → retrieveChunks()        embed + Qdrant search (12 candidates)
+  → confidence gate         skip / refuse / judge based on cosine topScore
+  → judgeAndRerank()        Phase B: LLM scores all chunks (uncertain zone only)
+      HIGH   → generate
+      LOW    → hard refuse (no generation cost)
+      MEDIUM → correctivePass() with original question → compare → generate
+```
+
+All four new components degrade gracefully — if any fails (timeout, API error), the pipeline continues with the previous stage's output. No additional credentials or infrastructure are required beyond the existing OpenRouter and HuggingFace keys.
+
+---
+
+### Observed Behavior (Real Logs — Adapter Design Pattern PDF)
+
+| Query | topScore | Path | Outcome |
+|---|---|---|---|
+| "What is the Adapter design pattern?" | 0.79 | high-cosine, judge skipped | Correct grounded answer |
+| "What is the difference between Target and Adaptee?" | 0.82 | high-cosine, judge skipped | Correct grounded answer |
+| "What is this document about?" | 0.58 | uncertain → judge → MEDIUM → corrective | Correct summary |
+| "tell me about the main concept" | 0.55 | uncertain → judge → HIGH (after rerank) | Correct conceptual answer |
+| "How does the Singleton pattern work?" | 0.68 | high-cosine, judge skipped → model refuses | Correct refusal |
+| "What is the best way to make sourdough bread?" | 0.51 | uncertain → judge → all chunks score 0 → LOW | Hard refuse, no generation |
+
+---
+
 ## Future Improvements
 
-Features that are architecturally straightforward extensions but out of scope for this assignment:
+Features out of scope for this assignment but architecturally straightforward to add:
 
-- **Streaming responses** — OpenRouter supports Server-Sent Events. The chat controller would switch from `res.json()` to a streaming response, and the frontend would render tokens progressively. The grounding logic stays identical.
-- **Conversational memory** — A sliding window of previous `{question, answer}` pairs could be injected into the prompt. The challenge is deciding how to merge history context with the retrieved document context without exceeding token budgets.
-- **Hybrid search** — Combining Qdrant's vector search with BM25 keyword search (sparse vectors) improves recall for exact-match queries like acronyms, names, or specific numbers that embeddings sometimes miss.
-- **Multi-document support** — The current architecture already stores all documents in one Qdrant collection with `documentId` filtering. A document management UI and the ability to switch between or search across uploaded documents would be incremental additions.
-- **Authentication** — The upload and chat endpoints are currently open. Adding a simple session token or API key per user would make the application deployable without public access concerns.
-- **Deployment** — Frontend on Vercel, backend on Render, Qdrant Cloud already configured. Environment variables are the only remaining step.
+- **Streaming responses** — OpenRouter supports Server-Sent Events. Switching from `res.json()` to a streaming response would let the frontend render tokens progressively. The grounding logic stays identical.
+- **Conversational memory** — A sliding window of previous `{question, answer}` pairs injected into the prompt. The challenge is merging history context with retrieved document context without exceeding token budgets.
+- **Hybrid search** — Combining Qdrant's dense vector search with BM25 keyword search (sparse vectors) improves recall for exact-match queries such as acronyms, proper names, or specific numbers that embeddings sometimes miss.
+- **Cross-encoder reranking** — Replace the LLM judge with a dedicated cross-encoder model (`BAAI/bge-reranker-base`) for faster, more consistent chunk scoring. Lower latency than a free-tier LLM call; requires a separate HuggingFace model endpoint.
+- **Multi-document support** — The architecture already stores all documents in one Qdrant collection with `documentId` filtering. A document management UI and cross-document search would be incremental additions.
+- **Authentication** — The upload and chat endpoints are currently open. A simple session token per user would make the application safely deployable to a public audience.
 
 
 ## Note: The backend is deployed on Render's free tier, so the first request after inactivity may take a few seconds due to cold starts.

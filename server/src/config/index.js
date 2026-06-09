@@ -73,6 +73,43 @@ module.exports = {
     lowConfidenceWarnScore: 0.5,
   },
 
+  // --- Query rewriting (Phase A) ---
+  queryRewriting: {
+    // Rewrites user questions into retrieval-optimized phrases before embedding.
+    // Uses config.llm.model and OPENROUTER_API_KEY — no additional credentials needed.
+    // Set to false to bypass rewriting and embed the raw user question directly.
+    enabled: true,
+  },
+
+  // --- Confidence gate + CRAG (Phase C/D) ---
+  confidenceGate: {
+    // Cosine score below this → refuse immediately, skip judge (clearly off-topic)
+    hardRefuseBelow: 0.35,
+    // Cosine score at or above this → skip judge, generate directly (clearly on-topic)
+    skipJudgeAbove: 0.65,
+    // In the uncertain zone [hardRefuseBelow, skipJudgeAbove):
+    //   judge verdict HIGH   → generate normally
+    //   judge verdict MEDIUM → attempt one corrective retrieval pass (CRAG)
+    //   judge verdict LOW    → refuse (judge confirmed irrelevance)
+    maxCorrectiveAttempts: 1,
+  },
+
+  // --- Retrieval judge (Phase B) ---
+  retrievalJudge: {
+    // LLM-as-Judge: re-scores and reranks retrieved chunks before generation.
+    // A single batched LLM call evaluates all candidates; see retrievalJudge.js.
+    // Set to false to skip reranking and use original Qdrant cosine order.
+    enabled: true,
+    timeoutMs: 12_000,
+    temperature: 0.0,   // deterministic — scores must be consistent across runs
+    // Maximum chars of each chunk's text sent to the judge.
+    // Keeps token usage predictable; 400 chars is enough to assess content type.
+    chunkPreviewLength: 400,
+    // Score thresholds for verdict labels (inclusive).
+    highThreshold: 7,   // score >= 7 → HIGH
+    lowThreshold: 3,    // score <= 3 → LOW; else MEDIUM
+  },
+
   // --- LLM (OpenRouter) ---
   llm: {
     model: process.env.LLM_MODEL || 'openai/gpt-oss-20b:free',
