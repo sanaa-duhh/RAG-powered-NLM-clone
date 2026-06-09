@@ -98,22 +98,32 @@ async function runPipeline(question, documentId) {
   const topVerdict = topChunk?.judgeVerdict ?? null;
   const topJudgeScore = topChunk?.judgeScore ?? 5;
 
-  // ── LOW → judge confirmed irrelevance → hard refuse ───────────────────────
-  if (topVerdict === 'LOW') {
-    logStep('PIPELINE', `Judge verdict LOW (${topJudgeScore}) — refusing`);
+  // ── Score 0 → genuinely off-topic → hard refuse ─────────────────────────
+  // Score 0 means the judge found zero relevance (e.g. sourdough vs code document).
+  // Score 1-3 (LOW verdict) can still mean code chunks on a meta-question — those
+  // have some relevance and are worth a corrective pass before refusing.
+  if (topJudgeScore === 0) {
+    logStep('PIPELINE', `Judge score 0 — completely off-topic, refusing`);
     logDone(rewriteInfo, topChunk, null, 'hard-refuse-judge');
     return hardRefuse(retrievalResult, rewriteInfo);
   }
 
-  // ── MEDIUM → CRAG corrective retrieval pass ───────────────────────────────
-  if (topVerdict === 'MEDIUM') {
+  // ── LOW or MEDIUM → CRAG corrective retrieval pass ───────────────────────
+  // LOW with score > 0: code-heavy chunks on a broad question — try corrective
+  // before giving up. MEDIUM: standard corrective path.
+  if (topVerdict === 'LOW' || topVerdict === 'MEDIUM') {
     logStep(
       'PIPELINE',
-      `Judge verdict MEDIUM (${topJudgeScore}) — attempting corrective retrieval`,
+      `Judge verdict ${topVerdict} (${topJudgeScore}) — attempting corrective retrieval`,
     );
     const corrected = await correctivePass(question, documentId, rerankedChunks);
     if (corrected) {
       retrievalResult.chunks = corrected;
+    } else if (topVerdict === 'LOW') {
+      // Corrective also failed to improve — now refuse
+      logStep('PIPELINE', `Corrective did not improve LOW context — refusing`);
+      logDone(rewriteInfo, topChunk, null, 'hard-refuse-after-corrective');
+      return hardRefuse(retrievalResult, rewriteInfo);
     }
   }
 
