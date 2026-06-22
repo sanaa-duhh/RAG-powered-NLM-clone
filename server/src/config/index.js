@@ -53,17 +53,18 @@ module.exports = {
 
   // --- Retrieval ---
   retrieval: {
-    defaultTopK: 4,
+    defaultTopK: 5,
     defaultMinScore: 0.4,
 
     // Candidate over-fetch multiplier — retrieve.js fetches topK * this
     // before deduplication so the final topK slots have more to choose from.
     candidateMultiplier: 3,
 
-    // Context budget — caps what gets forwarded to the LLM (Phase 3).
-    // At ~250 words/1000 chars, 4000 chars ≈ 1000 words of context.
+    // Context budget for semantic chunks (summary chunk is always prepended
+    // on top of this by ragPipeline.js, outside the budget).
+    // At ~250 words/1000 chars, 5000 chars ≈ 1250 words of context.
     maxContextChunks: 5,
-    maxContextChars: 4000,
+    maxContextChars: 5000,
 
     // Jaccard similarity above this between two chunks → near-duplicate → drop lower score.
     // 0.85 catches true duplicates; lower (0.5) would also remove heavy-overlap pairs.
@@ -110,12 +111,24 @@ module.exports = {
     lowThreshold: 3,    // score <= 3 → LOW; else MEDIUM
   },
 
-  // --- LLM (OpenRouter) ---
+  // --- Document summary (generated once on ingest) ---
+  summary: {
+    // LLM-generated prose summary stored as a special chunk (chunkIndex: -1).
+    // Always injected into LLM context by ragPipeline.js, bypassing cosine ranking.
+    // Fixes broad "what is this about?" queries where specific chunks score low.
+    enabled: true,
+    // Max chars of document content fed to the LLM for summary generation.
+    // First ~1000 words — enough to capture the document's scope and purpose.
+    maxInputChars: 4000,
+  },
+
+  // --- LLM (Mistral AI) ---
   llm: {
-    model: process.env.LLM_MODEL || 'openai/gpt-oss-20b:free',
+    model: process.env.LLM_MODEL || 'mistral-small-latest',
+    apiKey: process.env.MISTRAL_API_KEY,
     temperature: 0.1, // low = deterministic, prevents creative hallucinations
     timeoutMs: 30_000,
-    baseUrl: 'https://openrouter.ai/api/v1/chat/completions',
+    baseUrl: 'https://api.mistral.ai/v1/chat/completions',
 
     // Retry on 5xx / rate limits — free tier models can be briefly unavailable
     maxRetries: 2,

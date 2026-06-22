@@ -39,6 +39,7 @@ const { logStep, logError, logWarn } = require('../utils/logger');
 const AppError = require('../utils/AppError');
 const { chunkDocuments } = require('./chunk');
 const { debugChunks } = require('./debug');
+const { generateDocumentSummary } = require('./summarize');
 
 const { embedTexts } = require('./embeddings');
 const { upsertChunks } = require('./vectorStore');
@@ -98,6 +99,29 @@ async function ingest(file) {
     // --- Step 4: Validate chunk output ---
     if (chunks.length === 0) {
       throw new AppError('NO_CHUNKS', 'Document produced no valid chunks after splitting', 400);
+    }
+
+    // --- Step 4.5: Generate document summary and prepend as special chunk ---
+    // The summary chunk (chunkIndex: -1) is always injected into LLM context
+    // by ragPipeline.js, bypassing cosine ranking. This guarantees that broad
+    // questions ("what is this about?") always have a prose overview available.
+    const summaryText = await generateDocumentSummary(chunks, file.originalname);
+    if (summaryText) {
+      const summaryChunk = {
+        text: summaryText,
+        metadata: {
+          chunkId: `${documentId}-summary`,
+          documentId,
+          filename: file.originalname,
+          chunkIndex: -1,
+          totalChunks: chunks.length,
+          pageNumber: null,
+          textPreview: summaryText.slice(0, 200),
+          isSummary: true,
+        },
+      };
+      chunks.unshift(summaryChunk);
+      logStep('INGEST', `Summary chunk prepended | ${summaryText.length} chars`);
     }
 
     // Sample chunk previews for retrieval quality assessment

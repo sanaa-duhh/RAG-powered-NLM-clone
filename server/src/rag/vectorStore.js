@@ -162,6 +162,7 @@ async function upsertChunks(chunks, vectors) {
       chunkIndex: chunk.metadata.chunkIndex,
       totalChunks: chunk.metadata.totalChunks,
       pageNumber: chunk.metadata.pageNumber ?? null,
+      isSummary: chunk.metadata.isSummary ?? false,
     },
   }));
 
@@ -227,6 +228,12 @@ async function similaritySearch(queryVector, documentId, options = {}) {
     vector: queryVector,
     filter: {
       must: [{ key: 'documentId', match: { value: documentId } }],
+      // Exclude the summary chunk from vector search — it is always fetched
+      // separately and injected by ragPipeline.js with score 1.0 and a
+      // special label. Including it here pollutes cosine ranking and causes
+      // the model to see it with a low relevance score (0.5x), not as a
+      // priority overview.
+      must_not: [{ key: 'isSummary', match: { value: true } }],
     },
     limit,
     ...(scoreThreshold !== undefined ? { score_threshold: scoreThreshold } : {}),
@@ -356,11 +363,61 @@ function validateUpsertInput(chunks, vectors) {
 }
 
 /**
- * Creates a keyword payload index on the `documentId` field.
+ * Fetches the summary chunk for a document (chunkIndex: -1, isSummary: true).
+ * Returns null if the document was indexed before summary support was added,
+ * or if summary generation failed during ingest.
  *
- * Qdrant Cloud enforces strict mode: any payload field used as a filter must have
- * an explicit index. Without it, search requests return HTTP 400 "Index required".
- * createPayloadIndex is idempotent — calling it when the index already exists is safe.
+ * Uses Qdrant scroll (no vector required) since we fetch by exact field match.
+ *
+ * @param {string} documentId
+ * @returns {Promise<{ score: number, text: string, metadata: object } | null>}
+ */
+async function fetchSummaryChunk(documentId) {
+  if (!documentId) return null;
+
+  const client = getClient();
+  const { collection } = config.qdrant;
+
+  try {
+    const result = await client.scroll(collection, {
+      filter: {
+        must: [
+          { key: 'documentId', match: { value: documentId } },
+          { key: 'isSummary', match: { value: true } },
+        ],
+      },
+      limit: 1,
+      with_payload: true,
+      with_vector: false,
+    });
+
+    if (!result.points || result.points.length === 0) return null;
+
+    const p = result.points[0].payload;
+    return {
+      score: 1.0, // always highest priority — not cosine-ranked
+      text: p.text,
+      metadata: {
+        chunkId: p.chunkId,
+        documentId: p.documentId,
+        filename: p.filename,
+        chunkIndex: p.chunkIndex,
+        totalChunks: p.totalChunks,
+        pageNumber: p.pageNumber,
+        textPreview: p.textPreview,
+        isSummary: true,
+      },
+    };
+  } catch (err) {
+    logWarn('QDRANT', `fetchSummaryChunk failed: ${err.message} — proceeding without summary`);
+    return null;
+  }
+}
+
+/**
+ * Creates payload indexes required by Qdrant Cloud strict mode.
+ * Any field used as a filter must have an explicit index.
+ * createPayloadIndex is idempotent — safe to call on every startup.
  */
 async function ensureDocumentIdIndex(client, collection) {
   await client.createPayloadIndex(collection, {
@@ -368,7 +425,12 @@ async function ensureDocumentIdIndex(client, collection) {
     field_schema: 'keyword',
     wait: true,
   });
-  logStep('QDRANT', 'Payload index on "documentId" ready');
+  await client.createPayloadIndex(collection, {
+    field_name: 'isSummary',
+    field_schema: 'bool',
+    wait: true,
+  });
+  logStep('QDRANT', 'Payload indexes on "documentId" and "isSummary" ready');
 }
 
 /**
@@ -399,10 +461,50 @@ function extractVectorParams(vectorsConfig) {
   return null;
 }
 
+/**
+ * Fetches all non-summary chunks for a document (no vector search).
+ * Used by hybrid retrieval to compute keyword scores across the full corpus.
+ * Capped at maxChunks to avoid fetching huge documents on every query.
+ *
+ * @param {string} documentId
+ * @param {number} maxChunks
+ * @returns {Promise<Array<{ text: string, metadata: object }>>}
+ */
+async function fetchAllChunks(documentId, maxChunks = 150) {
+  const client = getClient();
+  const { collection } = config.qdrant;
+
+  const result = await client.scroll(collection, {
+    filter: {
+      must: [{ key: 'documentId', match: { value: documentId } }],
+      must_not: [{ key: 'isSummary', match: { value: true } }],
+    },
+    with_payload: true,
+    with_vector: false,
+    limit: maxChunks,
+  });
+
+  return (result.points || []).map((p) => ({
+    score: 0,
+    text: p.payload.text,
+    metadata: {
+      chunkId: p.payload.chunkId,
+      documentId: p.payload.documentId,
+      filename: p.payload.filename,
+      chunkIndex: p.payload.chunkIndex,
+      totalChunks: p.payload.totalChunks,
+      pageNumber: p.payload.pageNumber,
+      textPreview: p.payload.textPreview,
+    },
+  }));
+}
+
 module.exports = {
   initializeCollection,
   upsertChunks,
   similaritySearch,
+  fetchSummaryChunk,
+  fetchAllChunks,
   deleteByDocumentId,
   getCollectionInfo,
 };

@@ -3,11 +3,7 @@
 /**
  * ragPipeline.js — Advanced RAG + CRAG orchestration layer.
  *
- * chatController.js delegates here. This is the only file that changes
- * as new RAG phases are added. chatController does not change again.
- *
  * Pipeline (Phase A → D):
- *
  *   question
  *     → rewriteQuery()              Phase A: retrieval-optimized query
  *     → retrieveChunks()            embed + Qdrant search
@@ -16,23 +12,15 @@
  *     → CRAG corrective pass        Phase D: retry with original question on MEDIUM verdict
  *     → generateAnswer()            Phase A infrastructure, unchanged
  *
- * Confidence gate tiers (by Qdrant cosine topScore):
- *   topScore < hardRefuseBelow (0.35):  refuse immediately — too far off-topic for judge to help
- *   topScore ≥ skipJudgeAbove (0.65):   skip judge — cosine already reliable at this score
- *   [0.35, 0.65):                       uncertain zone → judge → act on verdict
- *
- * Judge verdict actions (uncertain zone only):
- *   HIGH   → generate normally
- *   MEDIUM → one corrective retrieval pass (CRAG); use whichever has higher top judge score
- *   LOW    → hard refuse (judge confirmed irrelevance; corrective pass won't help)
- *
- * All new components (judge, corrective pass) never throw — they degrade gracefully.
+ * onStage(stage) is called at each pipeline step for SSE stage indicators.
+ * onToken(token) is forwarded to generateAnswer for streaming LLM output.
  */
 
 const { rewriteQuery } = require('./queryRewriter');
 const { retrieveChunks } = require('./retrieve');
 const { judgeAndRerank } = require('./retrievalJudge');
 const { generateAnswer, REFUSAL_PHRASE } = require('./generate');
+const { fetchSummaryChunk } = require('./vectorStore');
 const config = require('../config');
 const { logStep, logWarn } = require('../utils/logger');
 
@@ -41,23 +29,32 @@ const { logStep, logWarn } = require('../utils/logger');
 // ---------------------------------------------------------------------------
 
 /**
- * @param {string} question   — raw user question
- * @param {string} documentId — scopes all retrieval to one document
- * @returns {Promise<{ retrievalResult, generation, rewriteInfo }>}
+ * @param {string} question
+ * @param {string} documentId
+ * @param {Array}  history   — last N chat turns for multi-turn context
+ * @param {object} options   — { onStage, onToken } for SSE streaming
  */
-async function runPipeline(question, documentId) {
+async function runPipeline(question, documentId, history = [], options = {}) {
+  const { onStage = () => {}, onToken = null } = options;
+
   logStep('PIPELINE', `Start | documentId: ${documentId.slice(0, 8)}...`);
 
-  // ── Phase A: query rewriting ──────────────────────────────────────────────
-  const rewriteInfo = await rewriteQuery(question);
+  // ── Phase A: query rewriting + speculative original embedding (parallel) ──
+  onStage('rewriting');
+  const { embedQuery } = require('./embeddings');
+  const [rewriteInfo] = await Promise.all([
+    rewriteQuery(question),
+    embedQuery(question, { noFallback: true }).catch(() => null), // warm cache only
+  ]);
+
+  onStage('retrieving');
   const retrievalResult = await retrieveChunks(rewriteInfo.rewritten, documentId);
-  // Restore original question so the LLM answers what the user actually asked
   retrievalResult.query = question;
 
   // ── No results ────────────────────────────────────────────────────────────
   if (retrievalResult.chunks.length === 0) {
     logStep('PIPELINE', 'No chunks retrieved — hard refuse');
-    const generation = await generateAnswer(retrievalResult); // returns REFUSAL_PHRASE via existing logic
+    const generation = await generateAnswer(retrievalResult, history);
     logDone(rewriteInfo, null, generation, 'no-results');
     return { retrievalResult, generation, rewriteInfo };
   }
@@ -67,10 +64,7 @@ async function runPipeline(question, documentId) {
 
   // ── Tier 1: extremely low cosine → refuse without judge ───────────────────
   if (topScore < hardRefuseBelow) {
-    logStep(
-      'PIPELINE',
-      `Cosine ${topScore.toFixed(3)} < ${hardRefuseBelow} — refusing (skip judge)`,
-    );
+    logStep('PIPELINE', `Cosine ${topScore.toFixed(3)} < ${hardRefuseBelow} — refusing (skip judge)`);
     logDone(rewriteInfo, null, null, 'hard-refuse-cosine');
     return hardRefuse(retrievalResult, rewriteInfo);
   }
@@ -78,57 +72,48 @@ async function runPipeline(question, documentId) {
   // ── Tier 2: high cosine → skip judge, generate directly ──────────────────
   if (topScore >= skipJudgeAbove) {
     logStep('PIPELINE', `Cosine ${topScore.toFixed(3)} ≥ ${skipJudgeAbove} — skipping judge`);
-    const generation = await generateAnswer(retrievalResult);
+    await injectSummaryChunk(retrievalResult, documentId);
+    onStage('generating');
+    const generation = await generateAnswer(retrievalResult, history, onToken);
     logDone(rewriteInfo, null, generation, 'high-cosine');
     return { retrievalResult, generation, rewriteInfo };
   }
 
-  // ── Tier 3: uncertain zone [hardRefuseBelow, skipJudgeAbove) → run judge ──
-  logStep(
-    'PIPELINE',
-    `Cosine ${topScore.toFixed(3)} in uncertain zone — running judge`,
-  );
-
-  // Phase B: LLM-as-Judge reranking (never throws)
+  // ── Tier 3: uncertain zone → run judge ───────────────────────────────────
+  logStep('PIPELINE', `Cosine ${topScore.toFixed(3)} in uncertain zone — running judge`);
+  onStage('judging');
   const rerankedChunks = await judgeAndRerank(question, rewriteInfo, retrievalResult.chunks);
   retrievalResult.chunks = rerankedChunks;
 
   const topChunk = rerankedChunks[0];
-  // null means judge fell back (timeout/error) — degrade to Qdrant order, generate normally
   const topVerdict = topChunk?.judgeVerdict ?? null;
   const topJudgeScore = topChunk?.judgeScore ?? 5;
 
-  // ── Score 0 → genuinely off-topic → hard refuse ─────────────────────────
-  // Score 0 means the judge found zero relevance (e.g. sourdough vs code document).
-  // Score 1-3 (LOW verdict) can still mean code chunks on a meta-question — those
-  // have some relevance and are worth a corrective pass before refusing.
   if (topJudgeScore === 0) {
     logStep('PIPELINE', `Judge score 0 — completely off-topic, refusing`);
     logDone(rewriteInfo, topChunk, null, 'hard-refuse-judge');
     return hardRefuse(retrievalResult, rewriteInfo);
   }
 
-  // ── LOW or MEDIUM → CRAG corrective retrieval pass ───────────────────────
-  // LOW with score > 0: code-heavy chunks on a broad question — try corrective
-  // before giving up. MEDIUM: standard corrective path.
   if (topVerdict === 'LOW' || topVerdict === 'MEDIUM') {
-    logStep(
-      'PIPELINE',
-      `Judge verdict ${topVerdict} (${topJudgeScore}) — attempting corrective retrieval`,
-    );
+    logStep('PIPELINE', `Judge verdict ${topVerdict} (${topJudgeScore}) — attempting corrective retrieval`);
+    onStage('correcting');
     const corrected = await correctivePass(question, documentId, rerankedChunks);
     if (corrected) {
       retrievalResult.chunks = corrected;
     } else if (topVerdict === 'LOW') {
-      // Corrective also failed to improve — now refuse
       logStep('PIPELINE', `Corrective did not improve LOW context — refusing`);
       logDone(rewriteInfo, topChunk, null, 'hard-refuse-after-corrective');
       return hardRefuse(retrievalResult, rewriteInfo);
     }
   }
 
+  // ── Inject summary chunk ──────────────────────────────────────────────────
+  await injectSummaryChunk(retrievalResult, documentId);
+
   // ── Generate ──────────────────────────────────────────────────────────────
-  const generation = await generateAnswer(retrievalResult);
+  onStage('generating');
+  const generation = await generateAnswer(retrievalResult, history, onToken);
   const verdictLabel = topVerdict ? topVerdict.toLowerCase() : 'fallback';
   logDone(rewriteInfo, retrievalResult.chunks[0], generation, 'judge-' + verdictLabel);
   return { retrievalResult, generation, rewriteInfo };
@@ -138,24 +123,9 @@ async function runPipeline(question, documentId) {
 // CRAG corrective retrieval pass
 // ---------------------------------------------------------------------------
 
-/**
- * Attempts a second retrieval using the original (unrewritten) question.
- * Returns the corrected chunks if they score better than the first pass,
- * or null to keep the original result.
- *
- * Uses the original question because the Phase A rewrite may have shifted
- * the embedding in a direction that missed relevant content. The original
- * question embeds differently and may surface different candidates.
- *
- * @param {string} originalQuestion
- * @param {string} documentId
- * @param {Array} previousChunks — Phase B reranked chunks from pass 1
- * @returns {Promise<Array|null>}
- */
 async function correctivePass(originalQuestion, documentId, previousChunks) {
   const prevTopScore = previousChunks[0]?.judgeScore ?? 0;
 
-  // Retrieve with original question (different embedding path)
   let corrResult;
   try {
     corrResult = await retrieveChunks(originalQuestion, documentId);
@@ -169,14 +139,10 @@ async function correctivePass(originalQuestion, documentId, previousChunks) {
     return null;
   }
 
-  // Judge the corrective candidates (pass null for rewriteInfo — no rewrite on this pass)
   const corrReranked = await judgeAndRerank(originalQuestion, null, corrResult.chunks);
   const corrTopScore = corrReranked[0]?.judgeScore ?? 0;
 
-  logStep(
-    'PIPELINE',
-    `Corrective: pass-1 top=${prevTopScore} → pass-2 top=${corrTopScore}`,
-  );
+  logStep('PIPELINE', `Corrective: pass-1 top=${prevTopScore} → pass-2 top=${corrTopScore}`);
 
   if (corrTopScore > prevTopScore) {
     logStep('PIPELINE', 'Corrective retrieval improved score — using corrected chunks');
@@ -185,6 +151,25 @@ async function correctivePass(originalQuestion, documentId, previousChunks) {
 
   logStep('PIPELINE', 'Corrective retrieval did not improve — keeping original chunks');
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// Summary chunk injection
+// ---------------------------------------------------------------------------
+
+async function injectSummaryChunk(retrievalResult, documentId) {
+  try {
+    const summary = await fetchSummaryChunk(documentId);
+    if (!summary) return;
+
+    retrievalResult.chunks = retrievalResult.chunks.filter(
+      (c) => c.metadata.chunkId !== summary.metadata.chunkId,
+    );
+    retrievalResult.chunks.unshift(summary);
+    logStep('PIPELINE', `Summary chunk injected | ${summary.text.length} chars`);
+  } catch (err) {
+    logWarn('PIPELINE', `Summary injection failed: ${err.message} — proceeding without it`);
+  }
 }
 
 // ---------------------------------------------------------------------------
