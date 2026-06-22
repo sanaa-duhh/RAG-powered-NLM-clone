@@ -9,8 +9,10 @@ const morgan = require('morgan');
 const path = require('path');
 const fs = require('fs');
 
+const rateLimit = require('express-rate-limit');
 const uploadRoutes = require('./routes/upload');
 const chatRoutes = require('./routes/chat');
+const documentRoutes = require('./routes/documents');
 const errorHandler = require('./middleware/errorHandler');
 const { logInfo, logWarn, logError } = require('./utils/logger');
 const { validateEnv } = require('./config/validateEnv');
@@ -46,9 +48,28 @@ app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
+// --- Rate limiting ---
+const uploadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 20,
+  message: { success: false, error: 'TOO_MANY_UPLOADS' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+const chatLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 30,
+  message: { success: false, error: 'TOO_MANY_REQUESTS' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 // --- Routes ---
+app.use('/api/upload', uploadLimiter);
+app.use('/api/chat', chatLimiter);
 app.use('/api', uploadRoutes);
 app.use('/api', chatRoutes);
+app.use('/api', documentRoutes);
 
 // Health check — used by Render to verify the service is up
 app.get('/api/health', (req, res) => {

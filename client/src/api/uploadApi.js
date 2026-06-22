@@ -29,6 +29,10 @@ export function validateFile(file) {
  * @param {(pct: number) => void} [onProgress]
  * @returns {Promise<{ documentId: string, filename: string, chunksCreated: number }>}
  */
+export async function deleteDocument(documentId) {
+  await api.delete(`/api/documents/${documentId}`);
+}
+
 export async function uploadDocument(file, onProgress) {
   const form = new FormData();
   form.append('file', file);
