@@ -33,6 +33,31 @@ const { logStep, logWarn, logError } = require('../utils/logger');
 
 const RETRY_ATTEMPTS = 3;
 const RETRY_BASE_DELAY_MS = 2000;
+
+// ---------------------------------------------------------------------------
+// Query embedding cache (query-only — document chunks are never cached)
+// ---------------------------------------------------------------------------
+
+// Simple LRU: Map preserves insertion order; on overflow, delete the oldest.
+const QUERY_CACHE_MAX = 200;
+const queryCache = new Map();
+
+function getCached(text) {
+  const hit = queryCache.get(text);
+  if (!hit) return null;
+  // Refresh recency: delete + re-insert moves it to the end
+  queryCache.delete(text);
+  queryCache.set(text, hit);
+  return hit;
+}
+
+function setCache(text, vector) {
+  if (queryCache.size >= QUERY_CACHE_MAX) {
+    // Delete the oldest entry (first key in Map)
+    queryCache.delete(queryCache.keys().next().value);
+  }
+  queryCache.set(text, vector);
+}
 const RETRY_BACKOFF_FACTOR = 2; // delay doubles each attempt: 2s → 4s → 8s
 
 // ---------------------------------------------------------------------------
@@ -88,7 +113,15 @@ async function embedQuery(text, options = {}) {
   if (typeof text !== 'string' || text.trim().length === 0) {
     throw new Error('embedQuery requires a non-empty string');
   }
+
+  const cached = getCached(text);
+  if (cached) {
+    logStep('EMBED', `Cache hit for query (${text.length} chars)`);
+    return cached;
+  }
+
   const vectors = await embedTexts([text], options);
+  setCache(text, vectors[0]);
   return vectors[0];
 }
 
