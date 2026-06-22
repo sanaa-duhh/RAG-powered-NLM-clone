@@ -42,10 +42,80 @@
  */
 
 const { embedQuery } = require('./embeddings');
-const { similaritySearch } = require('./vectorStore');
+const { similaritySearch, fetchAllChunks } = require('./vectorStore');
 const config = require('../config');
 const AppError = require('../utils/AppError');
 const { logStep, logWarn } = require('../utils/logger');
+
+// ---------------------------------------------------------------------------
+// Hybrid search helpers (keyword scoring + RRF)
+// ---------------------------------------------------------------------------
+
+const STOPWORDS = new Set([
+  'a','an','the','and','or','but','in','on','at','to','for','of','with',
+  'is','are','was','were','be','been','being','have','has','had','do','does',
+  'did','will','would','could','should','may','might','shall','can',
+  'i','you','he','she','it','we','they','this','that','these','those',
+  'what','which','who','how','when','where','why','not','no','so','if',
+]);
+
+function tokenize(text) {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length > 1 && !STOPWORDS.has(w));
+}
+
+/**
+ * Score a chunk by term frequency of query tokens (normalized by chunk length).
+ * Returns 0.0–1.0.
+ */
+function keywordScore(chunkText, queryTokens) {
+  if (queryTokens.length === 0) return 0;
+  const words = tokenize(chunkText);
+  if (words.length === 0) return 0;
+  const wordSet = words.reduce((map, w) => {
+    map.set(w, (map.get(w) ?? 0) + 1);
+    return map;
+  }, new Map());
+
+  let matches = 0;
+  for (const qt of queryTokens) {
+    matches += wordSet.get(qt) ?? 0;
+  }
+  return matches / Math.sqrt(words.length);
+}
+
+/**
+ * Reciprocal Rank Fusion of two ranked lists.
+ * Chunks appearing in both lists score higher.
+ * Keyword-only chunks (missed by vector search) are also surfaced.
+ */
+function reciprocalRankFusion(vectorChunks, keywordChunks, k = 60) {
+  const scores = new Map(); // chunkId → { rrfScore, chunk }
+
+  vectorChunks.forEach((chunk, rank) => {
+    const id = chunk.metadata.chunkId;
+    scores.set(id, { rrfScore: 1 / (k + rank + 1), chunk });
+  });
+
+  // Keyword list is sorted by tf score (desc); assign rank from that order
+  keywordChunks.forEach((chunk, rank) => {
+    const id = chunk.metadata.chunkId;
+    const kwScore = 1 / (k + rank + 1);
+    const existing = scores.get(id);
+    if (existing) {
+      existing.rrfScore += kwScore;
+    } else {
+      scores.set(id, { rrfScore: kwScore, chunk });
+    }
+  });
+
+  return Array.from(scores.values())
+    .sort((a, b) => b.rrfScore - a.rrfScore)
+    .map(({ chunk }) => chunk);
+}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -141,8 +211,35 @@ async function retrieveChunks(question, documentId, options = {}) {
     );
   }
 
+  // --- Step 4.5: Hybrid search — keyword scoring + RRF fusion ---
+  // Fetches all document chunks, scores by term frequency, merges with RRF.
+  // Surfaces chunks that vector search missed (exact keyword matches).
+  // Skipped for very large documents (>150 chunks) to avoid latency.
+  let hybridResults = rawResults;
+  const queryTokens = tokenize(question);
+  if (queryTokens.length > 0) {
+    try {
+      const allChunks = await fetchAllChunks(documentId, 150);
+      if (allChunks.length > 0 && allChunks.length <= 150) {
+        // Score all chunks by keyword relevance, sort descending
+        const keywordRanked = allChunks
+          .map((chunk) => ({ ...chunk, _kwScore: keywordScore(chunk.text, queryTokens) }))
+          .filter((c) => c._kwScore > 0)
+          .sort((a, b) => b._kwScore - a._kwScore)
+          .slice(0, candidateK);
+
+        if (keywordRanked.length > 0) {
+          hybridResults = reciprocalRankFusion(rawResults, keywordRanked);
+          logStep('RETRIEVE', `Hybrid: vector ${rawResults.length} + keyword ${keywordRanked.length} → RRF ${hybridResults.length}`);
+        }
+      }
+    } catch (err) {
+      logWarn('RETRIEVE', `Hybrid search failed (${err.message}) — using vector-only results`);
+    }
+  }
+
   // --- Step 5: Deduplicate near-identical chunks ---
-  const deduped = deduplicateChunks(rawResults, dedupeThreshold);
+  const deduped = deduplicateChunks(hybridResults, dedupeThreshold);
   if (deduped.length < rawResults.length) {
     logStep(
       'RETRIEVE',
