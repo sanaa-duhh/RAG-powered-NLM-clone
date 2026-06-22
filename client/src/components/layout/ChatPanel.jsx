@@ -2,18 +2,48 @@ import React, { useState, useRef, useEffect } from 'react';
 import Input from '../ui/Input';
 import Button from '../ui/Button';
 import MarkdownContent from '../ui/MarkdownContent';
-import { sendMessage } from '../../api/chatApi';
+import { sendMessageStream } from '../../api/chatApi';
 
-export default function ChatPanel({ documentId }) {
+const STORAGE_KEY = (id) => `rag_chat_${id}`;
+
+const STAGE_LABELS = {
+  rewriting:  'Rewriting query…',
+  retrieving: 'Retrieving chunks…',
+  judging:    'Evaluating quality…',
+  correcting: 'Corrective retrieval…',
+  generating: 'Generating answer…',
+};
+
+export default function ChatPanel({ documentId, filename }) {
   const [messages, setMessages] = useState([]);
   const [question, setQuestion] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [currentStage, setCurrentStage] = useState(null);
   const messagesEndRef = useRef(null);
   const msgIdRef = useRef(0);
 
-  function nextId() {
-    return ++msgIdRef.current;
-  }
+  function nextId() { return ++msgIdRef.current; }
+
+  // Load persisted chat when active document changes
+  useEffect(() => {
+    if (!documentId) { setMessages([]); return; }
+    try {
+      const stored = localStorage.getItem(STORAGE_KEY(documentId));
+      setMessages(stored ? JSON.parse(stored) : []);
+    } catch { setMessages([]); }
+    msgIdRef.current = 0;
+  }, [documentId]);
+
+  // Persist chat whenever messages update
+  useEffect(() => {
+    if (!documentId || messages.length === 0) return;
+    try {
+      localStorage.setItem(STORAGE_KEY(documentId), JSON.stringify(
+        // Don't persist streaming:true — clean up on save
+        messages.map((m) => ({ ...m, streaming: false }))
+      ));
+    } catch { /* storage full */ }
+  }, [messages, documentId]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -24,65 +54,96 @@ export default function ChatPanel({ documentId }) {
     if (!q || isLoading || !documentId) return;
 
     setQuestion('');
-    setMessages((prev) => [...prev, { id: nextId(), role: 'user', content: q }]);
+    const userMsgId = nextId();
+    setMessages((prev) => [...prev, { id: userMsgId, role: 'user', content: q }]);
     setIsLoading(true);
+    setCurrentStage('rewriting');
+
+    const history = messages.slice(-6).map((m) => ({ role: m.role, content: m.content }));
+    const asstId = nextId();
+    let hasStartedStreaming = false;
 
     try {
-      const data = await sendMessage(q, documentId);
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: nextId(),
-          role: 'assistant',
-          content: data.answer,
-          sources: data.sources ?? [],
-          refusal: data.refusal,
+      await sendMessageStream(q, documentId, history, {
+        onStage: (stage) => setCurrentStage(stage),
+
+        onToken: (token) => {
+          setMessages((prev) => {
+            const exists = prev.find((m) => m.id === asstId);
+            if (exists) {
+              return prev.map((m) =>
+                m.id === asstId ? { ...m, content: m.content + token } : m,
+              );
+            }
+            hasStartedStreaming = true;
+            return [...prev, { id: asstId, role: 'assistant', content: token, streaming: true }];
+          });
         },
-      ]);
+
+        onDone: (data) => {
+          if (hasStartedStreaming) {
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === asstId
+                  ? { ...m, content: data.answer, sources: data.sources ?? [], refusal: data.refusal, streaming: false }
+                  : m,
+              ),
+            );
+          } else {
+            // Refusal or instant response — no tokens were streamed
+            setMessages((prev) => [
+              ...prev,
+              { id: asstId, role: 'assistant', content: data.answer, sources: data.sources ?? [], refusal: data.refusal },
+            ]);
+          }
+        },
+
+        onError: (msg) => {
+          setMessages((prev) => {
+            const exists = prev.find((m) => m.id === asstId);
+            const errMsg = { id: asstId, role: 'assistant', content: msg || 'Something went wrong.', isError: true, streaming: false };
+            return exists ? prev.map((m) => (m.id === asstId ? errMsg : m)) : [...prev, errMsg];
+          });
+        },
+      });
     } catch (err) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: nextId(),
-          role: 'assistant',
-          content: err.message || 'Something went wrong. Please try again.',
-          isError: true,
-        },
-      ]);
+      const msg = err.message || 'Something went wrong. Please try again.';
+      setMessages((prev) => {
+        const exists = prev.find((m) => m.id === asstId);
+        const errMsg = { id: asstId, role: 'assistant', content: msg, isError: true };
+        return exists ? prev.map((m) => (m.id === asstId ? errMsg : m)) : [...prev, errMsg];
+      });
     } finally {
       setIsLoading(false);
+      setCurrentStage(null);
     }
   }
 
   function onKeyDown(e) {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      submit();
-    }
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); }
   }
 
   const showMessages = messages.length > 0 || isLoading;
+  const isStreaming = messages.some((m) => m.streaming);
 
   return (
     <div className="flex flex-col h-full bg-void">
-      {/* Message area */}
       <div className="flex-1 overflow-y-auto px-6 py-6">
         {!documentId ? (
           <EmptyState />
         ) : !showMessages ? (
-          <ReadyState />
+          <ReadyState filename={filename} />
         ) : (
           <div className="max-w-2xl mx-auto flex flex-col gap-5">
             {messages.map((msg) => (
               <Message key={msg.id} message={msg} />
             ))}
-            {isLoading && <ThinkingBubble />}
+            {isLoading && !isStreaming && <ThinkingBubble stage={currentStage} />}
             <div ref={messagesEndRef} />
           </div>
         )}
       </div>
 
-      {/* Input bar */}
       <div className="border-t border-white/[6%] bg-surface px-6 py-4">
         <div className="flex gap-3 max-w-2xl mx-auto">
           <Input
@@ -90,11 +151,7 @@ export default function ChatPanel({ documentId }) {
             onChange={(e) => setQuestion(e.target.value)}
             onKeyDown={onKeyDown}
             disabled={!documentId || isLoading}
-            placeholder={
-              documentId
-                ? 'Ask a question about your document…'
-                : 'Upload a document to start chatting'
-            }
+            placeholder={documentId ? 'Ask a question about your document…' : 'Upload a document to start chatting'}
           />
           <Button
             onClick={submit}
@@ -120,7 +177,6 @@ function Message({ message }) {
   return (
     <div className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
       <div className={`max-w-[85%] flex flex-col gap-2 ${isUser ? 'items-end' : 'items-start'}`}>
-        {/* Bubble */}
         <div
           className={
             isUser
@@ -133,12 +189,14 @@ function Message({ message }) {
           {isUser || message.isError ? (
             message.content
           ) : (
-            <MarkdownContent>{message.content}</MarkdownContent>
+            <>
+              <MarkdownContent>{message.content}</MarkdownContent>
+              {message.streaming && <span className="inline-block w-0.5 h-4 bg-emerald-400 animate-pulse ml-0.5 align-middle" />}
+            </>
           )}
         </div>
 
-        {/* Citations */}
-        {!isUser && !message.isError && message.sources && message.sources.length > 0 && (
+        {!isUser && !message.isError && !message.streaming && message.sources && message.sources.length > 0 && (
           <Citations sources={message.sources} />
         )}
       </div>
@@ -151,9 +209,11 @@ function Message({ message }) {
 // ---------------------------------------------------------------------------
 
 function Citations({ sources }) {
+  const [expanded, setExpanded] = React.useState(null);
+
   const seen = new Set();
   const unique = sources.filter((s) => {
-    const key = `${s.filename}:${s.pageNumber ?? '?'}`;
+    const key = `${s.filename}:${s.pageNumber ?? '?'}:${s.chunkIndex}`;
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
@@ -162,19 +222,37 @@ function Citations({ sources }) {
   if (unique.length === 0) return null;
 
   return (
-    <div className="flex flex-wrap gap-1.5 pl-1">
-      {unique.map((src, i) => (
-        <span
-          key={i}
-          className="inline-flex items-center gap-1.5 text-[11px] text-slate-500 bg-surface border border-emerald-400/15 rounded-md px-2.5 py-1 hover:border-emerald-400/30 hover:text-slate-400 transition-colors"
-        >
-          <svg className="w-3 h-3 shrink-0 text-emerald-400/50" fill="currentColor" viewBox="0 0 20 20">
-            <path fillRule="evenodd" d="M4 4a2 2 0 012-2h4.586A2 2 0 0112 2.586L15.414 6A2 2 0 0116 7.414V16a2 2 0 01-2 2H6a2 2 0 01-2-2V4z" clipRule="evenodd" />
-          </svg>
-          {src.filename}
-          {src.pageNumber != null ? `, p.${src.pageNumber}` : ''}
-        </span>
-      ))}
+    <div className="flex flex-col gap-1.5 pl-1 w-full">
+      <div className="flex flex-wrap gap-1.5">
+        {unique.map((src, i) => (
+          <button
+            key={i}
+            onClick={() => setExpanded(expanded === i ? null : i)}
+            className={`inline-flex items-center gap-1.5 text-[11px] rounded-md px-2.5 py-1 transition-colors cursor-pointer border ${
+              expanded === i
+                ? 'bg-emerald-400/10 border-emerald-400/40 text-emerald-300'
+                : 'text-slate-500 bg-surface border-emerald-400/15 hover:border-emerald-400/30 hover:text-slate-400'
+            }`}
+          >
+            <svg className="w-3 h-3 shrink-0 text-emerald-400/50" fill="currentColor" viewBox="0 0 20 20">
+              <path fillRule="evenodd" d="M4 4a2 2 0 012-2h4.586A2 2 0 0112 2.586L15.414 6A2 2 0 0116 7.414V16a2 2 0 01-2 2H6a2 2 0 01-2-2V4z" clipRule="evenodd" />
+            </svg>
+            {src.filename}
+            {src.pageNumber != null ? `, p.${src.pageNumber}` : ''}
+          </button>
+        ))}
+      </div>
+
+      {expanded !== null && unique[expanded]?.preview && (
+        <div className="mt-1 p-3 rounded-lg bg-white/[3%] border border-white/[8%] text-[11px] text-slate-400 leading-relaxed font-mono whitespace-pre-wrap break-words max-w-xl">
+          <p className="text-[10px] text-emerald-400/60 mb-1.5 font-sans font-medium uppercase tracking-wider">
+            Retrieved chunk · {unique[expanded].filename}
+            {unique[expanded].pageNumber != null ? ` · Page ${unique[expanded].pageNumber}` : ''}
+          </p>
+          {unique[expanded].preview}
+          {unique[expanded].preview.length >= 400 ? '…' : ''}
+        </div>
+      )}
     </div>
   );
 }
@@ -200,16 +278,19 @@ function EmptyState() {
   );
 }
 
-function ReadyState() {
+function ReadyState({ filename }) {
   return (
     <div className="flex flex-col items-center justify-center h-full gap-3 text-center select-none">
       <div className="w-2 h-2 rounded-full bg-emerald-400 shadow-glow-green-sm" />
-      <p className="text-sm text-slate-500">Document indexed — ask a question below</p>
+      <div>
+        <p className="text-sm text-slate-400 font-medium">{filename ?? 'Document ready'}</p>
+        <p className="text-xs text-slate-600 mt-1">Ask a question below</p>
+      </div>
     </div>
   );
 }
 
-function ThinkingBubble() {
+function ThinkingBubble({ stage }) {
   return (
     <div className="flex justify-start">
       <div className="px-4 py-3 rounded-2xl rounded-bl-sm bg-elevated border border-white/[7%] shadow-card flex items-center gap-2.5">
@@ -217,7 +298,7 @@ function ThinkingBubble() {
           <circle className="opacity-20" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
           <path className="opacity-80" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
         </svg>
-        <span className="text-sm text-slate-500">Thinking…</span>
+        <span className="text-sm text-slate-500">{STAGE_LABELS[stage] || 'Thinking…'}</span>
       </div>
     </div>
   );
