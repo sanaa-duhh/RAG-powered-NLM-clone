@@ -60,8 +60,8 @@ async function judgeAndRerank(originalQuestion, rewriteInfo, chunks) {
     return chunks;
   }
 
-  if (!process.env.OPENROUTER_API_KEY) {
-    logWarn('JUDGE', 'OPENROUTER_API_KEY not set — using original order');
+  if (!config.llm.apiKey) {
+    logWarn('JUDGE', 'MISTRAL_API_KEY not set — using original order');
     return chunks;
   }
 
@@ -132,10 +132,8 @@ async function callJudge(originalQuestion, rewrittenQuery, chunks) {
     },
     {
       headers: {
-        Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+        Authorization: `Bearer ${config.llm.apiKey}`,
         'Content-Type': 'application/json',
-        'HTTP-Referer': process.env.CLIENT_URL || 'http://localhost:3001',
-        'X-Title': 'NotebookLM RAG',
       },
       timeout: timeoutMs,
     },

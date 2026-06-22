@@ -8,7 +8,7 @@ const { logInfo, logWarn, logError } = require('../utils/logger');
  * In production, absence means an immediate startup failure with a clear message.
  */
 const REQUIRED_IN_PRODUCTION = [
-  'OPENROUTER_API_KEY',
+  'MISTRAL_API_KEY',
   'HF_API_KEY',
   'QDRANT_URL',
   'QDRANT_API_KEY',

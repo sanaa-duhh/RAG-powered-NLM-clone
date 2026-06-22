@@ -73,12 +73,12 @@ async function rewriteQuery(question) {
   }
 
   // --- Guard: missing API key ---
-  if (!process.env.OPENROUTER_API_KEY) {
-    logWarn('REWRITE', 'OPENROUTER_API_KEY not set — using original query');
+  if (!config.llm.apiKey) {
+    logWarn('REWRITE', 'MISTRAL_API_KEY not set — using original query');
     return { original: question, rewritten: question, skipped: true };
   }
 
-  const { model, baseUrl } = config.llm;
+  const { model, apiKey, baseUrl } = config.llm;
 
   logStep('REWRITE', `Original: "${question.slice(0, 80)}${question.length > 80 ? '...' : ''}"`);
 
@@ -97,10 +97,8 @@ async function rewriteQuery(question) {
       },
       {
         headers: {
-          Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+          Authorization: `Bearer ${apiKey}`,
           'Content-Type': 'application/json',
-          'HTTP-Referer': process.env.CLIENT_URL || 'http://localhost:3001',
-          'X-Title': 'NotebookLM RAG',
         },
         timeout: REWRITE_TIMEOUT_MS,
       },
